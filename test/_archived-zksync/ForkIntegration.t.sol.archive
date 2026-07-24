@@ -1,0 +1,524 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import {Test} from "forge-std/Test.sol";
+import {TriangleArb} from "../contracts/TriangleArb.sol";
+import {TriangleArbFlash} from "../contracts/TriangleArbFlash.sol";
+import {TriangleArbBase} from "../contracts/TriangleArbBase.sol";
+import {ISwapAdapter} from "../contracts/adapters/ISwapAdapter.sol";
+import {SyncSwapAdapter} from "../contracts/adapters/SyncSwapAdapter.sol";
+import {MuteAdapter} from "../contracts/adapters/MuteAdapter.sol";
+import {UniswapV2Adapter} from "../contracts/adapters/UniswapV2Adapter.sol";
+import {IERC20} from "../contracts/interfaces/IERC20.sol";
+
+/// @title ForkIntegration
+/// @notice Runs against a REAL zkSync Era mainnet fork to validate every
+/// placeholder flagged in README.md in one shot, against actual deployed
+/// bytecode rather than docs/explorer inspection:
+///   1. SyncSwap pool swap() step-data encoding (biggest unverified item)
+///   2. Mute router ABI/address
+///   3. SpaceFi ("thirdDex") router ABI/address
+///   4. Token addresses (WETH/USDC/USDT) actually behave like ERC20s and
+///      have live liquidity against each other on each DEX
+///
+/// HOW TO RUN:
+///   forge test --fork-url $ZKSYNC_RPC_URL --match-contract ForkIntegration -vvv
+///
+/// You need a zkSync Era mainnet RPC URL (e.g. from a provider like Alchemy,
+/// Infura, or the public https://mainnet.era.zksync.io endpoint). This test
+/// was written by inspecting the adapters/interfaces only — it has NEVER
+/// been run, since this sandbox has no outbound network access to zkSync
+/// RPC endpoints. Expect to need a few iterations: pool addresses, exact
+/// liquidity depth, and slippage tolerances below are best-effort guesses
+/// and may need adjusting once you can see real revert reasons.
+///
+/// DESIGN: each DEX is tested in its OWN isolated test function (a single
+/// hop, not the full triangle) before the combined end-to-end test. This
+/// matters — if you only ran the full triangle and it reverted, you'd have
+/// no idea whether SyncSwap, Mute, or SpaceFi was the problem. Isolating
+/// them means a single failure tells you exactly which placeholder in
+/// README.md still needs fixing.
+contract ForkIntegrationTest is Test {
+    // ---- zkSync Era mainnet addresses (see README.md for provenance / confidence on each) ----
+    address constant WETH = 0x5AEa5775959fBC2557Cc8789bC1bf90A239D9a91; // confirmed against a zkSync community doc during this review
+    // USDC.e: NOT independently confirmed in this review (only WETH above was).
+    // USDC.e is bridged USDC and the long-established address on zkSync Era;
+    // if your deployment target is native USDC instead, override via env var
+    // and re-run — see setUp(). Verify against era.zksync.network either way.
+    address DEFAULT_USDC_GUESS = 0x3355df6D4c9C3035724Fd0e3914dE96A5a83aaf4;
+    address usdcE;
+
+    // NOT independently confirmed by this review — see README.md. Override
+    // with FORK_TEST_USDT env var if you've confirmed a different address.
+    address DEFAULT_USDT_GUESS = address(0);
+
+    address constant SYNCSWAP_ROUTER = 0x2da10A1e27bF85cEdD8FFb1AbBe97e53391C0295;
+    // CORRECTED during live fork testing: the address previously here
+    // (0xC458eED5...) was actually a Scroll Alpha / Polygon zkEVM TESTNET
+    // router, not a zkSync Era mainnet address - a mis-copy from an earlier,
+    // jumbled search result. This is the real mainnet SyncSwapRouter,
+    // confirmed by fetching docs.syncswap.xyz/api-documentation/resources/
+    // smart-contract directly and reading the "zkSync Era Mainnet" section.
+    address DEFAULT_SYNCSWAP_FACTORY_GUESS = 0xf2DAd89f2788a8CD54625C60b55cD3d2D0ACa7Cb;
+    // ^ This one was correct from the start (same source/fetch as above,
+    // same mainnet section) - an earlier attempt to "fix" it to a different,
+    // testnet-only address was itself the mistake, and has been reverted.
+    address syncswapFactory;
+
+    // Placeholders per README — MUST be overridden via env vars before this
+    // test can pass; left as address(0) here so setUp() fails loudly and
+    // immediately with a clear message rather than silently using a wrong
+    // guess for something this load-bearing.
+    address MUTE_ROUTER;
+    address THIRD_DEX_ROUTER; // SpaceFi, per the current README default
+
+    address WETH_USDC_SYNCSWAP_POOL;
+    address usdt;
+
+    // zkSwap Finance RouterV2 (classic UniV2-shaped router — same 5-arg
+    // swapExactTokensForTokens signature as SpaceFi, so UniswapV2Adapter
+    // works unmodified). Sourced from zkSwap Finance's own official docs
+    // (docs.zkswap.finance/contracts-and-audits/contracts-addresses/zksync-era/dex-zksync,
+    // "RouterV2 (Verified)" row) during this review. This is DOCS-LEVEL
+    // confirmation only, same tier as the SyncSwap Vault address below it —
+    // NOT yet confirmed via a real executed swap the way the SyncSwap/Mute/
+    // SpaceFi router addresses above were (see README.md "Fork test
+    // findings"). Treat it the same way those started out: verify address,
+    // ABI, and actual WETH/USDC.e and USDT/WETH liquidity depth on
+    // era.zksync.network / explorer.zksync.io before trusting it with real
+    // capital. Override via FORK_TEST_ZKSWAP_ROUTER if needed.
+    address DEFAULT_ZKSWAP_ROUTER_GUESS = 0x18381c0f738146Fb694DE18D1106BdE2BE040Fa4;
+    address ZKSWAP_ROUTER;
+
+    TriangleArb arb;
+    TriangleArbFlash arbFlash;
+    SyncSwapAdapter syncAdapter;
+    MuteAdapter muteAdapter;
+    UniswapV2Adapter thirdAdapter;
+    UniswapV2Adapter zkswapAdapter; // separate UniswapV2Adapter instance pointed at zkSwap Finance RouterV2
+
+    // Confirmed against docs.syncswap.xyz/syncswap/smart-contracts (see
+    // README.md) — same vault address already proven live via the
+    // SyncSwapAdapter fork test (its deposit/withdraw flow was exercised
+    // as part of that swap).
+    address constant SYNCSWAP_VAULT = 0x621425a1Ef6abE91058E9712575dcc4258F8d091;
+
+    address owner = address(this);
+
+    function setUp() public {
+        // All of these MUST come from env vars you've independently verified
+        // per README.md — this test refuses to guess load-bearing addresses.
+        MUTE_ROUTER = vm.envOr("FORK_TEST_MUTE_ROUTER", address(0));
+        THIRD_DEX_ROUTER = vm.envOr("FORK_TEST_THIRD_DEX_ROUTER", address(0xbE7D1FD1f6748bbDefC4fbaCafBb11C6Fc506d1d));
+        usdt = vm.envOr("FORK_TEST_USDT", DEFAULT_USDT_GUESS);
+        usdcE = vm.envOr("FORK_TEST_USDC", DEFAULT_USDC_GUESS);
+        syncswapFactory = vm.envOr("FORK_TEST_SYNCSWAP_FACTORY", DEFAULT_SYNCSWAP_FACTORY_GUESS);
+        ZKSWAP_ROUTER = vm.envOr("FORK_TEST_ZKSWAP_ROUTER", DEFAULT_ZKSWAP_ROUTER_GUESS);
+
+        require(MUTE_ROUTER != address(0), "set FORK_TEST_MUTE_ROUTER before running (see README.md)");
+
+        arb = new TriangleArb();
+        arbFlash = new TriangleArbFlash(SYNCSWAP_VAULT);
+        syncAdapter = new SyncSwapAdapter(SYNCSWAP_ROUTER);
+        muteAdapter = new MuteAdapter(MUTE_ROUTER);
+        thirdAdapter = new UniswapV2Adapter(THIRD_DEX_ROUTER);
+        zkswapAdapter = new UniswapV2Adapter(ZKSWAP_ROUTER);
+
+        arb.setAdapterAllowed(address(syncAdapter), true);
+        arb.setAdapterAllowed(address(muteAdapter), true);
+        arb.setAdapterAllowed(address(thirdAdapter), true);
+        arb.setAdapterAllowed(address(zkswapAdapter), true);
+        arbFlash.setAdapterAllowed(address(syncAdapter), true);
+        arbFlash.setAdapterAllowed(address(muteAdapter), true);
+        arbFlash.setAdapterAllowed(address(thirdAdapter), true);
+        arbFlash.setAdapterAllowed(address(zkswapAdapter), true);
+
+        // syncAdapter routes through the same protocol (SyncSwap) as
+        // SYNCSWAP_VAULT, the flash lender arbFlash borrows from. Fork-test
+        // confirmed: using it in any leg while a loan from that vault is in
+        // flight reverts with the VAULT's own reentrancy guard, not a bug in
+        // this contract. Block it explicitly so that failure mode surfaces
+        // as a clear AdapterBlockedDuringFlashLoan revert instead.
+        arbFlash.setBlockedDuringFlashLoan(address(syncAdapter), true);
+
+        // Fetch the live SyncSwap classic pool for WETH/USDC via the factory,
+        // exactly as README.md instructs the off-chain scanner to do — do
+        // NOT hardcode a pool address here, since pool addresses are
+        // deterministic per-factory but this keeps the test honest about
+        // that requirement matching production usage.
+        (bool ok, bytes memory data) = syncswapFactory.staticcall(
+            abi.encodeWithSignature("getPool(address,address)", WETH, usdcE)
+        );
+        require(ok, "SyncSwapClassicPoolFactory.getPool() call failed - factory address or ABI may be wrong");
+        WETH_USDC_SYNCSWAP_POOL = abi.decode(data, (address));
+        require(WETH_USDC_SYNCSWAP_POOL != address(0), "no SyncSwap classic pool exists for WETH/USDC.e - check token addresses");
+
+        // Fund the arb contract directly (pre-funded TriangleArb variant;
+        // flash-loan variant is exercised separately in TriangleArbFlash.t.sol
+        // against a mock vault, not here, since forking + a live flash loan
+        // adds another live-liquidity dependency on top of the ones this
+        // file already isolates).
+        deal(WETH, address(arb), 1 ether);
+    }
+
+    /// @notice Isolated check: does the deployed SyncSwap pool actually
+    /// accept the (tokenIn, to, withdrawMode) step-data encoding
+    /// SyncSwapAdapter.sol assumes? This is the single biggest unverified
+    /// item in README.md - if this test fails, the step-data format is
+    /// wrong and SyncSwapAdapter.sol needs to be updated to match whatever
+    /// the actual pool.swap() ABI expects (check the pool contract directly
+    /// on era.zksync.network if so).
+    /// @dev Calls the adapter DIRECTLY, not via arb.executeTriangle() - a
+    /// single WETH->USDC hop doesn't return to WETH, and executeTriangle
+    /// enforces legs[last].tokenOut == startToken, so routing through it
+    /// would revert on that check before ever reaching SyncSwap, giving a
+    /// false "SyncSwap is broken" signal for what's actually a test
+    /// harness constraint. Calling the adapter directly isolates exactly
+    /// what this test is meant to check: the pool ABI, nothing else.
+    function test_SyncSwap_WethToUsdc_SingleHop() public {
+        deal(WETH, address(this), 0.1 ether);
+        IERC20(WETH).approve(address(syncAdapter), 0.1 ether);
+
+        ISwapAdapter.Hop[] memory hops = new ISwapAdapter.Hop[](1);
+        hops[0] = ISwapAdapter.Hop({
+            tokenIn: WETH,
+            tokenOut: usdcE,
+            amountOutMin: 1, // deliberately tiny - this test is about ABI correctness, not pricing
+            extraData: abi.encode(WETH_USDC_SYNCSWAP_POOL)
+        });
+
+        uint256 usdcBefore = IERC20(usdcE).balanceOf(address(this));
+
+        try syncAdapter.executeMultiHop(hops, 0.1 ether, 1) returns (uint256 amountOut) {
+            assertGt(amountOut, 0, "SyncSwap hop returned 0 - check step-data encoding");
+            uint256 usdcAfter = IERC20(usdcE).balanceOf(address(this));
+            assertGt(usdcAfter, usdcBefore, "SyncSwap hop produced no USDC - check step-data encoding");
+        } catch Error(string memory reason) {
+            emit log_string(string.concat("SyncSwap single-hop call reverted: ", reason));
+            fail();
+        }
+    }
+
+    /// @notice Isolated check: does MUTE_ROUTER actually implement
+    /// IMuteSwitchRouterDynamic.swapExactTokensForTokens with the stable-flag
+    /// array signature MuteAdapter.sol assumes?
+    /// @dev Calls the adapter directly - see the comment on
+    /// test_SyncSwap_WethToUsdc_SingleHop for why.
+    function test_Mute_UsdcToUsdt_SingleHop() public {
+        deal(usdcE, address(this), 100e6); // USDC.e is 6 decimals
+        IERC20(usdcE).approve(address(muteAdapter), 100e6);
+
+        ISwapAdapter.Hop[] memory hops = new ISwapAdapter.Hop[](1);
+        hops[0] = ISwapAdapter.Hop({
+            tokenIn: usdcE,
+            tokenOut: usdt,
+            amountOutMin: 1,
+            extraData: abi.encode(true) // stable pool - USDC/USDT are correlated
+        });
+
+        uint256 usdtBefore = IERC20(usdt).balanceOf(address(this));
+
+        try muteAdapter.executeMultiHop(hops, 50e6, 1) returns (uint256 amountOut) {
+            assertGt(amountOut, 0, "Mute hop returned 0 - check router address/ABI, or try stable=false");
+            uint256 usdtAfter = IERC20(usdt).balanceOf(address(this));
+            assertGt(usdtAfter, usdtBefore, "Mute hop produced no USDT - check router address/ABI, or try stable=false");
+        } catch Error(string memory reason) {
+            emit log_string(string.concat("Mute single-hop call reverted: ", reason));
+            fail();
+        }
+    }
+
+    /// @notice Isolated check: does THIRD_DEX_ROUTER (SpaceFi by default)
+    /// actually implement the classic 5-arg UniswapV2 swapExactTokensForTokens
+    /// (WITH deadline) that UniswapV2Adapter.sol assumes? This is the gap
+    /// flagged in README.md that couldn't be closed without live RPC access.
+    /// @dev Calls the adapter directly - see the comment on
+    /// test_SyncSwap_WethToUsdc_SingleHop for why.
+    function test_ThirdDex_UsdtToWeth_SingleHop() public {
+        deal(usdt, address(this), 100e6); // assuming 6 decimals - VERIFY, some bridged USDT variants differ
+        IERC20(usdt).approve(address(thirdAdapter), 100e6);
+
+        ISwapAdapter.Hop[] memory hops = new ISwapAdapter.Hop[](1);
+        hops[0] = ISwapAdapter.Hop({
+            tokenIn: usdt,
+            tokenOut: WETH,
+            amountOutMin: 1,
+            extraData: ""
+        });
+
+        uint256 wethBefore = IERC20(WETH).balanceOf(address(this));
+
+        try thirdAdapter.executeMultiHop(hops, 50e6, 1) returns (uint256 amountOut) {
+            assertGt(amountOut, 0, "thirdDex hop returned 0 - confirms the ABI mismatch flagged in README.md");
+            uint256 wethAfter = IERC20(WETH).balanceOf(address(this));
+            assertGt(wethAfter, wethBefore, "thirdDex hop produced no WETH - confirms the ABI mismatch flagged in README.md");
+        } catch Error(string memory reason) {
+            emit log_string(string.concat(
+                "thirdDex single-hop call reverted: ", reason,
+                " -- if THIRD_DEX_ROUTER is SpaceFi, this either means the ",
+                "address is stale, the pair has no liquidity, or (per README.md) ",
+                "the deployed contract's ABI doesn't actually match classic UniV2."
+            ));
+            fail();
+        }
+    }
+
+    /// @notice The real end-to-end triangle: WETH -> USDC (SyncSwap) ->
+    /// USDT (Mute) -> WETH (thirdDex). Only meaningful once the three
+    /// isolated tests above pass - if this fails but the isolated ones
+    /// don't, the bug is in leg-chaining/amountOutMin math, not DEX ABIs.
+    /// NOTE: this does not assert profitability (real mainnet liquidity may
+    /// not round-trip profitably at the moment you run this) - it only
+    /// asserts the full chain executes without reverting, with minProfit
+    /// set low enough to tolerate a round-trip loss. Check the emitted
+    /// TriangleExecuted event / final WETH balance manually to see whether
+    /// it happened to be profitable.
+    function test_FullTriangle_WethUsdcUsdtWeth() public {
+        ISwapAdapter.Hop[] memory hop1 = new ISwapAdapter.Hop[](1);
+        hop1[0] = ISwapAdapter.Hop({
+            tokenIn: WETH,
+            tokenOut: usdcE,
+            amountOutMin: 1,
+            extraData: abi.encode(WETH_USDC_SYNCSWAP_POOL)
+        });
+
+        ISwapAdapter.Hop[] memory hop2 = new ISwapAdapter.Hop[](1);
+        hop2[0] = ISwapAdapter.Hop({
+            tokenIn: usdcE,
+            tokenOut: usdt,
+            amountOutMin: 1,
+            extraData: abi.encode(true)
+        });
+
+        ISwapAdapter.Hop[] memory hop3 = new ISwapAdapter.Hop[](1);
+        hop3[0] = ISwapAdapter.Hop({
+            tokenIn: usdt,
+            tokenOut: WETH,
+            amountOutMin: 1,
+            extraData: ""
+        });
+
+        TriangleArbBase.Leg[] memory legs = new TriangleArbBase.Leg[](3);
+        legs[0] = TriangleArbBase.Leg({adapter: address(syncAdapter), hops: hop1, amountOutMin: 1});
+        legs[1] = TriangleArbBase.Leg({adapter: address(muteAdapter), hops: hop2, amountOutMin: 1});
+        legs[2] = TriangleArbBase.Leg({adapter: address(thirdAdapter), hops: hop3, amountOutMin: 1});
+
+        // minProfit intentionally 0 - see note above. A round-trip WETH ->
+        // USDC -> USDT -> WETH across three real pools' fees will very
+        // likely show a small LOSS at real-world size, which is expected
+        // and fine; this test is about "does it execute", not "is it
+        // profitable right now".
+        vm.prank(owner);
+        try arb.executeTriangle(legs, 0.1 ether, 0, block.timestamp + 300) returns (uint256 profit) {
+            emit log_named_uint("Triangle executed. Profit (wei, may be 0 or reverted-if-negative)", profit);
+        } catch Error(string memory reason) {
+            emit log_string(string.concat("Full triangle reverted: ", reason));
+            fail();
+        }
+    }
+
+    /// @notice Flash-loan variant of the full triangle, with a SyncSwap leg
+    /// deliberately included while also borrowing from SyncSwap's own
+    /// Vault — this MUST revert via the isBlockedDuringFlashLoan guard,
+    /// not execute successfully.
+    /// @dev Uses a SyncSwap leg while borrowing from SyncSwap's own Vault.
+    /// With isBlockedDuringFlashLoan wired up in setUp(), this MUST now
+    /// revert with AdapterBlockedDuringFlashLoan before attempting any swap
+    /// - fork-test confirmed (see README.md "Fork test findings") that this
+    /// exact combination otherwise reaches the vault's OWN reentrancy guard
+    /// (a generic "ReentrancyGuard: reentrant call" from the lender, not
+    /// this contract) three calls deep, after the loan is already taken.
+    /// Failing fast here, before flashLoan() is even called, is strictly
+    /// better: no loan attempted, no gas spent on doomed swaps.
+    /// @dev Rotation starts from USDC.e, NOT WETH — the Vault holds ~2M
+    /// USDC.e but 0 WETH (see README.md "Fork test findings"), so a
+    /// WETH-first version of this test would revert on
+    /// INSUFFICIENT_FLASH_LOAN_BALANCE before onFlashLoan (and therefore
+    /// this guard) is ever reached at all, masking whether the guard
+    /// itself works. This version borrows USDC.e so flashLoan() actually
+    /// succeeds and onFlashLoan runs, letting the guard's own check fire
+    /// as the thing under test. SyncSwap is leg index 2 (last) here,
+    /// rather than first, as an incidental second data point that the
+    /// guard checks every leg, not just leg 0.
+    function test_FlashTriangle_WethUsdcUsdtWeth_RevertsFastOnSyncSwapLeg() public {
+        ISwapAdapter.Hop[] memory hop1 = new ISwapAdapter.Hop[](1);
+        hop1[0] = ISwapAdapter.Hop({
+            tokenIn: usdcE,
+            tokenOut: usdt,
+            amountOutMin: 1,
+            extraData: abi.encode(true)
+        });
+
+        ISwapAdapter.Hop[] memory hop2 = new ISwapAdapter.Hop[](1);
+        hop2[0] = ISwapAdapter.Hop({
+            tokenIn: usdt,
+            tokenOut: WETH,
+            amountOutMin: 1,
+            extraData: ""
+        });
+
+        ISwapAdapter.Hop[] memory hop3 = new ISwapAdapter.Hop[](1);
+        hop3[0] = ISwapAdapter.Hop({
+            tokenIn: WETH,
+            tokenOut: usdcE,
+            amountOutMin: 1,
+            extraData: abi.encode(WETH_USDC_SYNCSWAP_POOL)
+        });
+
+        TriangleArbBase.Leg[] memory legs = new TriangleArbBase.Leg[](3);
+        legs[0] = TriangleArbBase.Leg({adapter: address(muteAdapter), hops: hop1, amountOutMin: 1});
+        legs[1] = TriangleArbBase.Leg({adapter: address(thirdAdapter), hops: hop2, amountOutMin: 1});
+        legs[2] = TriangleArbBase.Leg({adapter: address(syncAdapter), hops: hop3, amountOutMin: 1});
+
+        // No deal() / pre-funding here on purpose - if the guard is doing
+        // its job, execution reverts before any swap is attempted, so
+        // there's nothing to pre-fund. Assert the SPECIFIC custom error and
+        // which leg index tripped it (2 - SyncSwap is last in this
+        // rotation), not just "some revert happened", so a future change
+        // that accidentally routes through a different failure path (e.g.
+        // the loan actually going through and hitting the vault's own
+        // reentrancy guard again) is caught as a regression rather than
+        // silently passing.
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(TriangleArbFlash.AdapterBlockedDuringFlashLoan.selector, address(syncAdapter), uint256(2))
+        );
+        arbFlash.executeTriangleFlash(legs, 100e6, 0, block.timestamp + 300);
+    }
+
+    /// @notice USDC.e-first rotation of the flash triangle, using the deep
+    /// real liquidity confirmed in SyncSwap's Vault for USDC.e (~2.00M at
+    /// last check - see README.md "Fork test findings"), unlike WETH which
+    /// the Vault held none of. Same three DEXs/adapters as
+    /// test_FlashTriangle_WethUsdcUsdtWeth, just rotated: USDC.e -> USDT
+    /// (Mute) -> WETH (SpaceFi) -> USDC.e (SyncSwap). Also useful as a
+    /// second data point on the foundry-zksync tooling limitation: here
+    /// the SyncSwap leg is LAST instead of first, so if this passes while
+    /// the WETH-first version didn't, that's evidence the limitation is
+    /// call-pattern/position-specific rather than "any SyncSwap call ever
+    /// fails in this tool."
+    function test_FlashTriangle_UsdcUsdtWethUsdc() public {
+        ISwapAdapter.Hop[] memory hop1 = new ISwapAdapter.Hop[](1);
+        hop1[0] = ISwapAdapter.Hop({
+            tokenIn: usdcE,
+            tokenOut: usdt,
+            amountOutMin: 1,
+            extraData: abi.encode(true)
+        });
+
+        ISwapAdapter.Hop[] memory hop2 = new ISwapAdapter.Hop[](1);
+        hop2[0] = ISwapAdapter.Hop({
+            tokenIn: usdt,
+            tokenOut: WETH,
+            amountOutMin: 1,
+            extraData: ""
+        });
+
+        ISwapAdapter.Hop[] memory hop3 = new ISwapAdapter.Hop[](1);
+        hop3[0] = ISwapAdapter.Hop({
+            tokenIn: WETH,
+            tokenOut: usdcE,
+            amountOutMin: 1,
+            extraData: abi.encode(WETH_USDC_SYNCSWAP_POOL)
+        });
+
+        TriangleArbBase.Leg[] memory legs = new TriangleArbBase.Leg[](3);
+        legs[0] = TriangleArbBase.Leg({adapter: address(muteAdapter), hops: hop1, amountOutMin: 1});
+        legs[1] = TriangleArbBase.Leg({adapter: address(thirdAdapter), hops: hop2, amountOutMin: 1});
+        legs[2] = TriangleArbBase.Leg({adapter: address(syncAdapter), hops: hop3, amountOutMin: 1});
+
+        // Borrowing 100 USDC.e (6 decimals) - trivial relative to the
+        // Vault's ~2.00M balance, well within maxFlashLoan(). minProfit=0
+        // for the same reason as the other flash test: this checks whether
+        // the mechanism works, not whether it's profitable right now.
+        vm.prank(owner);
+        try arbFlash.executeTriangleFlash(legs, 100e6, 0, block.timestamp + 300) returns (uint256 profit) {
+            emit log_named_uint("USDC.e-first flash triangle executed. Profit (raw USDC.e units, may be 0)", profit);
+        } catch Error(string memory reason) {
+            emit log_string(string.concat("USDC.e-first flash triangle reverted: ", reason));
+            fail();
+        } catch (bytes memory lowLevelData) {
+            emit log_string("USDC.e-first flash triangle reverted with no reason string (check whether this is the known foundry-zksync tooling limitation - see README.md)");
+            emit log_bytes(lowLevelData);
+            fail();
+        }
+    }
+
+    /// @notice SyncSwap-free swap rotation: borrows USDC.e from SyncSwap's
+    /// Vault (the ONLY role SyncSwap plays here), then swaps entirely
+    /// through Mute, SpaceFi, and zkSwap Finance — USDC.e -> USDT (Mute) ->
+    /// WETH (SpaceFi) -> USDC.e (zkSwap RouterV2). No SyncSwapAdapter leg
+    /// anywhere. This isolates flash-loan mechanics from SyncSwap's own
+    /// swap path entirely, so if a SyncSwap-swap-specific issue ever shows
+    /// up again (e.g. the foundry-zksync nested-call quirk noted on the
+    /// other flash tests), this test tells you whether borrowing alone
+    /// still works even when SyncSwap is never swapped through.
+    /// @dev ROUTING CORRECTED after live liquidity checks: the USDT->WETH
+    /// leg originally routed through zkSwap Finance, whose USDT/WETH pool
+    /// turned out to hold only ~$2,000 total (confirmed via getReserves())
+    /// — trivially exhausted, producing the catastrophic-looking losses
+    /// bot/check-profitability.js first reported. Checked all three
+    /// UniV2-shaped DEXs' USDT/WETH depth directly: zkSwap Finance (~$2K),
+    /// Mute (~$9K), SpaceFi (~$15K, the deepest). This test now routes
+    /// USDT->WETH through SpaceFi (thirdAdapter) instead — the same pair
+    /// already proven live in the original pre-funded TriangleArb fork
+    /// test. zkSwap Finance is kept for WETH->USDC.e, where its pool is
+    /// genuinely deep (~$108K, confirmed via getReserves()). See
+    /// README.md "Fork test findings" for the full comparison table and
+    /// provenance on every figure here.
+    /// @dev IMPORTANT — verification level: SYNCSWAP_ROUTER, MUTE_ROUTER,
+    /// and THIRD_DEX_ROUTER are each confirmed via a real executed swap
+    /// during prior fork-test runs (see README.md). ZKSWAP_ROUTER is
+    /// docs-sourced plus a live getAmountsOut/getReserves check, but has
+    /// NOT yet been exercised via an actual executed swap in this repo —
+    /// treat a failure specifically on the WETH->USDC.e leg as "confirm
+    /// zkSwap RouterV2's swap ABI itself," not as evidence of a
+    /// TriangleArbFlash/adapter bug.
+    function test_FlashTriangle_SyncSwapFree_UsdcUsdtWethUsdc() public {
+        ISwapAdapter.Hop[] memory hop1 = new ISwapAdapter.Hop[](1);
+        hop1[0] = ISwapAdapter.Hop({
+            tokenIn: usdcE,
+            tokenOut: usdt,
+            amountOutMin: 1,
+            extraData: abi.encode(true) // stable pair, same as the other Mute legs
+        });
+
+        ISwapAdapter.Hop[] memory hop2 = new ISwapAdapter.Hop[](1);
+        hop2[0] = ISwapAdapter.Hop({
+            tokenIn: usdt,
+            tokenOut: WETH,
+            amountOutMin: 1,
+            extraData: "" // UniswapV2Adapter ignores extraData
+        });
+
+        ISwapAdapter.Hop[] memory hop3 = new ISwapAdapter.Hop[](1);
+        hop3[0] = ISwapAdapter.Hop({
+            tokenIn: WETH,
+            tokenOut: usdcE,
+            amountOutMin: 1,
+            extraData: ""
+        });
+
+        TriangleArbBase.Leg[] memory legs = new TriangleArbBase.Leg[](3);
+        legs[0] = TriangleArbBase.Leg({adapter: address(muteAdapter), hops: hop1, amountOutMin: 1});
+        legs[1] = TriangleArbBase.Leg({adapter: address(thirdAdapter), hops: hop2, amountOutMin: 1});
+        legs[2] = TriangleArbBase.Leg({adapter: address(zkswapAdapter), hops: hop3, amountOutMin: 1});
+
+        // Same 100 USDC.e size and minProfit=0 reasoning as
+        // test_FlashTriangle_UsdcUsdtWethUsdc: trivial relative to the
+        // Vault's confirmed ~2.00M USDC.e balance, and this test checks
+        // "does the mechanism work end to end through these two DEXs,"
+        // not "is it profitable right now."
+        vm.prank(owner);
+        try arbFlash.executeTriangleFlash(legs, 100e6, 0, block.timestamp + 300) returns (uint256 profit) {
+            emit log_named_uint("SyncSwap-free flash triangle executed. Profit (raw USDC.e units, may be 0)", profit);
+        } catch Error(string memory reason) {
+            emit log_string(string.concat("SyncSwap-free flash triangle reverted: ", reason));
+            fail();
+        } catch (bytes memory lowLevelData) {
+            emit log_string("SyncSwap-free flash triangle reverted with no reason string (check ZKSWAP_ROUTER address/ABI/liquidity first - see test-level @dev note above)");
+            emit log_bytes(lowLevelData);
+            fail();
+        }
+    }
+}

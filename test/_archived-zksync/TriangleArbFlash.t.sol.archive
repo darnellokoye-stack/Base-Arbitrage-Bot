@@ -1,0 +1,184 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import {Test} from "forge-std/Test.sol";
+import {TriangleArbFlash} from "../contracts/TriangleArbFlash.sol";
+import {TriangleArbBase} from "../contracts/TriangleArbBase.sol";
+import {ISwapAdapter} from "../contracts/adapters/ISwapAdapter.sol";
+import {MockERC20, MockGoodAdapter, MaliciousAdapter} from "./mocks/TestMocks.sol";
+import {MockFlashVault} from "./mocks/MockFlashVault.sol";
+
+contract TriangleArbFlashTest is Test {
+    TriangleArbFlash arb;
+    MockFlashVault vault;
+    MockERC20 weth;
+    MockERC20 usdc;
+    MockERC20 usdt;
+
+    MockGoodAdapter adapterA;
+    MockGoodAdapter adapterB;
+    MockGoodAdapter adapterC;
+
+    address owner = address(0xA11CE);
+    address attacker = address(0xBAD);
+
+    uint256 constant VAULT_FEE_BPS = 9; // 0.09%, matching SyncSwap's typical flash fee scale
+
+    function setUp() public {
+        weth = new MockERC20("WETH");
+        usdc = new MockERC20("USDC");
+        usdt = new MockERC20("USDT");
+
+        vault = new MockFlashVault(VAULT_FEE_BPS);
+        vault.seedLiquidity(weth, 1000 ether); // vault needs WETH on hand to lend
+
+        vm.prank(owner);
+        arb = new TriangleArbFlash(address(vault));
+
+        adapterA = new MockGoodAdapter(0);
+        adapterB = new MockGoodAdapter(0);
+        adapterC = new MockGoodAdapter(0);
+
+        vm.startPrank(owner);
+        arb.setAdapterAllowed(address(adapterA), true);
+        arb.setAdapterAllowed(address(adapterB), true);
+        arb.setAdapterAllowed(address(adapterC), true);
+        vm.stopPrank();
+    }
+
+    function _hop(address tokenIn, address tokenOut) internal pure returns (ISwapAdapter.Hop[] memory hops) {
+        hops = new ISwapAdapter.Hop[](1);
+        hops[0] = ISwapAdapter.Hop(tokenIn, tokenOut, 0, "");
+    }
+
+    function _legs() internal view returns (TriangleArbBase.Leg[] memory legs) {
+        legs = new TriangleArbBase.Leg[](3);
+        legs[0] = TriangleArbBase.Leg(address(adapterA), _hop(address(weth), address(usdc)), 0);
+        legs[1] = TriangleArbBase.Leg(address(adapterB), _hop(address(usdc), address(usdt)), 0);
+        legs[2] = TriangleArbBase.Leg(address(adapterC), _hop(address(usdt), address(weth)), 0);
+    }
+
+    /// @dev THE key test for this feature: TriangleArbFlash starts with
+    /// ZERO WETH balance. If the flash-loan flow works, it can still execute
+    /// a profitable arb — proving pre-funding is genuinely not required.
+    function test_executesWithZeroPreFundedBalance() public {
+        assertEq(weth.balanceOf(address(arb)), 0);
+
+        // Inject enough profit on the final hop to clear both the 0.09% vault
+        // fee and the requested minProfit.
+        weth.mint(address(adapterC), 0.01 ether);
+
+        TriangleArbBase.Leg[] memory legs = _legs();
+        vm.prank(owner);
+        uint256 profit = arb.executeTriangleFlash(legs, 1 ether, 0.001 ether, block.timestamp + 60);
+
+        assertGe(profit, 0.001 ether);
+        assertEq(weth.balanceOf(address(arb)), profit); // started at 0, so balance == profit
+    }
+
+    function test_revertsIfProfitDoesNotCoverFlashFee() public {
+        // 0-fee adapters round-trip WETH exactly (1 ether -> 1 ether), but the
+        // vault still charges its 0.09% fee, which nothing here covers.
+        TriangleArbBase.Leg[] memory legs = _legs();
+        vm.prank(owner);
+        vm.expectRevert("profit below threshold after fee");
+        arb.executeTriangleFlash(legs, 1 ether, 0, block.timestamp + 60);
+    }
+
+    /// @dev Mirrors the live fork finding: routing a leg through an adapter
+    /// marked unsafe during this vault's flash loans must revert immediately
+    /// with AdapterBlockedDuringFlashLoan, naming the offending adapter and
+    /// leg index — before any swap or repayment logic runs. Uses adapterB
+    /// (the middle leg) to prove the index reported is correct, not just
+    /// "leg 0" by coincidence.
+    function test_revertsFastWhenLegUsesBlockedAdapter() public {
+        vm.prank(owner);
+        arb.setBlockedDuringFlashLoan(address(adapterB), true);
+
+        TriangleArbBase.Leg[] memory legs = _legs();
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(TriangleArbFlash.AdapterBlockedDuringFlashLoan.selector, address(adapterB), uint256(1))
+        );
+        arb.executeTriangleFlash(legs, 1 ether, 0, block.timestamp + 60);
+    }
+
+    /// @dev Unblocking must actually restore normal execution — this isn't
+    /// a one-way kill switch, since a lender/protocol pairing that's unsafe
+    /// today could change (or the owner could redeploy against a different
+    /// vault later without redeploying adapters).
+    function test_unblockingAdapterRestoresExecution() public {
+        vm.startPrank(owner);
+        arb.setBlockedDuringFlashLoan(address(adapterB), true);
+        arb.setBlockedDuringFlashLoan(address(adapterB), false);
+        vm.stopPrank();
+
+        weth.mint(address(adapterC), 0.01 ether);
+        TriangleArbBase.Leg[] memory legs = _legs();
+        vm.prank(owner);
+        uint256 profit = arb.executeTriangleFlash(legs, 1 ether, 0.001 ether, block.timestamp + 60);
+        assertGe(profit, 0.001 ether);
+    }
+
+    function test_setBlockedDuringFlashLoanRevertsIfNotOwner() public {
+        vm.prank(attacker);
+        vm.expectRevert("not owner");
+        arb.setBlockedDuringFlashLoan(address(adapterB), true);
+    }
+
+    function test_revertsIfNotOwner() public {
+        TriangleArbBase.Leg[] memory legs = _legs();
+        vm.prank(attacker);
+        vm.expectRevert("not owner");
+        arb.executeTriangleFlash(legs, 1 ether, 0, block.timestamp + 60);
+    }
+
+    function test_revertsPastDeadline() public {
+        TriangleArbBase.Leg[] memory legs = _legs();
+        vm.prank(owner);
+        vm.expectRevert("deadline expired");
+        arb.executeTriangleFlash(legs, 1 ether, 0, block.timestamp - 1);
+    }
+
+    /// @dev onFlashLoan must reject any call that didn't originate from this
+    /// contract's own executeTriangleFlash — an attacker calling onFlashLoan
+    /// directly (even if they somehow got the vault to call it) must not be
+    /// able to make TriangleArbFlash approve away funds.
+    function test_onFlashLoanRejectsUntrustedLender() public {
+        vm.prank(attacker);
+        vm.expectRevert("untrusted lender");
+        arb.onFlashLoan(address(arb), address(weth), 1 ether, 0, "");
+    }
+
+    function test_onFlashLoanRejectsUntrustedInitiator() public {
+        // Even if called by the real vault, if `initiator` isn't this
+        // contract itself, reject — prevents a scenario where the vault
+        // could be tricked into crediting someone else's loan to this
+        // contract's callback.
+        vm.prank(address(vault));
+        vm.expectRevert("untrusted initiator");
+        arb.onFlashLoan(attacker, address(weth), 1 ether, 0, "");
+    }
+
+    /// @dev Malicious adapter regression test, same as the pre-funded suite,
+    /// but in the flash-loan path: an adapter overreaching its approval must
+    /// revert the whole flash loan (including repayment), not partially
+    /// succeed.
+    function test_maliciousAdapterCannotExceedApprovedAllowanceInFlashPath() public {
+        MaliciousAdapter evil = new MaliciousAdapter();
+        vm.prank(owner);
+        arb.setAdapterAllowed(address(evil), true);
+
+        TriangleArbBase.Leg[] memory legs = new TriangleArbBase.Leg[](2);
+        legs[0] = TriangleArbBase.Leg(address(evil), _hop(address(weth), address(usdc)), 0);
+        legs[1] = TriangleArbBase.Leg(address(adapterB), _hop(address(usdc), address(weth)), 0);
+
+        vm.prank(owner);
+        vm.expectRevert();
+        arb.executeTriangleFlash(legs, 1 ether, 0, block.timestamp + 60);
+
+        // No lingering balance — the whole flash loan (borrow + attempted
+        // swap + repay) reverted atomically.
+        assertEq(weth.balanceOf(address(arb)), 0);
+    }
+}

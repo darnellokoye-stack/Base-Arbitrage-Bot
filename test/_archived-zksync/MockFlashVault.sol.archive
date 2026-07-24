@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import {IERC20} from "../../contracts/interfaces/IERC20.sol";
+import {IERC3156FlashBorrower, IERC3156FlashLender} from "../../contracts/interfaces/IERC3156Flash.sol";
+import {MockERC20} from "./TestMocks.sol";
+
+/// @dev Minimal ERC-3156 flash lender, mirroring the real SyncSwap Vault's
+/// behavior for test purposes: transfers `amount` to the receiver, invokes
+/// onFlashLoan, then pulls `amount + fee` back via transferFrom (relying on
+/// the approval the receiver must grant inside onFlashLoan) — NOT a manual
+/// transfer from the receiver. This exercises the exact repayment path
+/// TriangleArbFlash.onFlashLoan relies on.
+contract MockFlashVault is IERC3156FlashLender {
+    uint256 public feeBps; // e.g. 9 = 0.09%, matching SyncSwap's typical flash fee scale
+
+    constructor(uint256 _feeBps) {
+        feeBps = _feeBps;
+    }
+
+    function maxFlashLoan(address token) external view override returns (uint256) {
+        return IERC20(token).balanceOf(address(this));
+    }
+
+    function flashFee(address /* token */, uint256 amount) public view override returns (uint256) {
+        return (amount * feeBps) / 10_000;
+    }
+
+    function flashLoan(
+        IERC3156FlashBorrower receiver,
+        address token,
+        uint256 amount,
+        bytes calldata data
+    ) external override returns (bool) {
+        uint256 fee = flashFee(token, amount);
+
+        IERC20(token).transfer(address(receiver), amount);
+
+        bytes32 result = receiver.onFlashLoan(msg.sender, token, amount, fee, data);
+        require(result == keccak256("ERC3156FlashBorrower.onFlashLoan"), "callback failed");
+
+        // Pull principal + fee back via the allowance the receiver granted
+        // inside onFlashLoan — matches SyncSwap Vault / standard ERC-3156
+        // lender behavior exactly (repayment by approval, not by transfer).
+        bool ok = IERC20(token).transferFrom(address(receiver), address(this), amount + fee);
+        require(ok, "repayment failed");
+
+        return true;
+    }
+
+    /// @dev Test helper to seed the vault with liquidity to lend out.
+    function seedLiquidity(MockERC20 token, uint256 amount) external {
+        token.mint(address(this), amount);
+    }
+}

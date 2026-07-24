@@ -1,0 +1,25 @@
+{
+  "name": "base-triangle-arb",
+  "version": "0.2.0",
+  "private": true,
+  "scripts": {
+    "scan": "node bot/scanner.js",
+    "scan:flash": "FLASH_MODE=1 node bot/scanner.js",
+    "scan:graph": "node bot/graph-scanner.js",
+    "scan:graph:flash": "FLASH_MODE=1 node bot/graph-scanner.js",
+    "test:graph": "node bot/graph/negativeCycle.test.js",
+    "backrun:watch": "node bot/backrun-monitor.js",
+    "base:new-pools": "node bot/base-edges/new-pool-listener.js",
+    "backtest:fetch": "node backtest/fetch-data.js",
+    "backtest:run": "node backtest/replay.js",
+    "backtest:report": "node backtest/report.js",
+    "backtest:test": "node backtest/test/ammMath.test.js && node backtest/test/reserveTimeline.test.js && node backtest/test/blockRange.test.js && node backtest/test/integration.smoke.test.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "viem": "^2.55.7",
+    "prom-client": "^15.1.3",
+    "express": "^5.2.1",
+    "sqlite3": "^6.0.1"
+  }
+}
