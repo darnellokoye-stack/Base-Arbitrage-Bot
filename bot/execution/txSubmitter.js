@@ -52,8 +52,24 @@ const { submitPreferPrivate } = require("./privateSubmit");
 
 const cfg = require("../config");
 
+function looksLikeNonceDrift(err) {
+  const message = `${err.shortMessage || ""} ${err.message || ""}`.toLowerCase();
+  return /nonce too low|nonce too high|replacement transaction underpriced|already known|already imported/.test(message);
+}
+
 function createTxSubmitter(deps, opts = {}) {
-  const { walletClient, publicClient, nonceManager, gasPricer, circuitBreaker, relayClient, allowPublicFallback, publicBroadcastMaxWei, estimationAccount } = deps;
+  const {
+    walletClient,
+    publicClient,
+    nonceManager,
+    gasPricer,
+    circuitBreaker,
+    relayClient,
+    allowPublicFallback,
+    publicBroadcastMaxWei,
+    estimationAccount,
+    simulatePrivateRelay,
+  } = deps;
   const metrics = deps.metrics || {
     incr() {},
     recordDuration() {},
@@ -121,9 +137,13 @@ function createTxSubmitter(deps, opts = {}) {
     let attempt = 0;
     let currentHash = null;
     let currentFees = fees;
+    let submitResult = null;
+    let viaPrivate = false;
+    const mutableArgs = Array.isArray(writeArgs.args) ? [...writeArgs.args] : writeArgs.args;
 
     while (attempt <= maxReplacementAttempts) {
       try {
+        const argsForAttempt = mutableArgs || writeArgs.args;
         // Build calldata from the provided writeArgs (address, abi,
         // functionName, args). We estimate gas, sign the transaction,
         // then submit the signed raw tx via the private relay (preferred)
@@ -131,7 +151,7 @@ function createTxSubmitter(deps, opts = {}) {
         const calldata = encodeFunctionData({
           abi: writeArgs.abi,
           functionName: writeArgs.functionName,
-          args: writeArgs.args,
+          args: argsForAttempt,
         });
 
         // Estimate gas units for this exact calldata; use the same
@@ -141,7 +161,7 @@ function createTxSubmitter(deps, opts = {}) {
           address: writeArgs.address,
           abi: writeArgs.abi,
           functionName: writeArgs.functionName,
-          args: writeArgs.args,
+          args: argsForAttempt,
           account: estimationAccount || walletClient.account?.address || undefined,
         });
         // gasLimit is a BigInt from viem; apply buffer in basis points.
@@ -154,7 +174,7 @@ function createTxSubmitter(deps, opts = {}) {
           // The contract's function signature for executeTriangle uses
           // args: [legs, amountIn, minProfit, deadline] — amountIn is
           // at index 1 when called from scanner.js. Use it if present.
-          const amountIn = (writeArgs.args && writeArgs.args.length > 1) ? BigInt(writeArgs.args[1]) : 0n;
+          const amountIn = (argsForAttempt && argsForAttempt.length > 1) ? BigInt(argsForAttempt[1]) : 0n;
           if (amountIn > BigInt(publicBroadcastMaxWei || 0n)) {
             console.error(
               `txSubmitter: refusing public broadcast for ${describeForLogs} — ` +
@@ -180,12 +200,19 @@ function createTxSubmitter(deps, opts = {}) {
         // Sign the transaction locally; this returns a serialized raw tx.
         const signedRawTx = await walletClient.signTransaction(tx);
 
+        if (simulatePrivateRelay && relayClient && relayClient.supportsBundleSimulation && relayClient.simulateBundle) {
+          await metrics.timeAsync("submit.private_relay_sim_ms", () =>
+            relayClient.simulateBundle([signedRawTx])
+          );
+          metrics.incr("submit.private_relay_sim_ok");
+        }
+
         // Submit the signed transaction preferring the private relay.
-        const submitResult = await metrics.timeAsync('submit.relay_ms', () =>
+        submitResult = await metrics.timeAsync('submit.relay_ms', () =>
           submitPreferPrivate({ publicClient, relayClient, allowPublicFallback: !!allowPublicFallback }, signedRawTx, describeForLogs)
         );
         currentHash = submitResult.hash;
-        const viaPrivate = !!submitResult.viaPrivateRelay;
+        viaPrivate = !!submitResult.viaPrivateRelay;
       } catch (err) {
         // A broadcast-time failure (not a confirmation-time one) means
         // this nonce was never accepted by the network at all — abandon
@@ -196,6 +223,10 @@ function createTxSubmitter(deps, opts = {}) {
           (err.shortMessage || err.message)
         );
         await nonceManager.onAbandoned(nonce);
+        if (looksLikeNonceDrift(err)) {
+          console.warn(`txSubmitter: nonce drift suspected for ${describeForLogs}; forcing an on-chain nonce resync.`);
+          await nonceManager.sync();
+        }
         circuitBreaker.recordFailure(`broadcast failed: ${err.shortMessage || err.message}`);
         metrics.incr("submit.broadcast_failed");
         return { confirmed: false, reason: `broadcast failed: ${err.shortMessage || err.message}` };
@@ -245,7 +276,7 @@ function createTxSubmitter(deps, opts = {}) {
       try {
         // Derive legs/amountIn/deadline from writeArgs.args (caller
         // constructs these in scanner.js as [legs, amountIn, minProfit, deadline]).
-        const argsClone = Array.isArray(writeArgs.args) ? [...writeArgs.args] : [];
+        const argsClone = Array.isArray(mutableArgs) ? [...mutableArgs] : [];
         const legs = argsClone[0];
         const amountIn = argsClone[1] || 0n;
         const deadline = argsClone[3] || BigInt(Math.floor(Date.now() / 1000) + 300);
@@ -280,6 +311,10 @@ function createTxSubmitter(deps, opts = {}) {
           circuitBreaker.recordFailure("replacement canceled: no longer profitable on resim");
           metrics.incr("submit.replacement_canceled_unprofitable");
           return { confirmed: false, reason: "replacement canceled: simulation no longer profitable" };
+        }
+        if (Array.isArray(mutableArgs)) {
+          mutableArgs[2] = requiredProfit;
+          mutableArgs[3] = deadline;
         }
       } catch (err) {
         console.warn(`txSubmitter: replacement canceled due to simulation error: ${err.message}`);

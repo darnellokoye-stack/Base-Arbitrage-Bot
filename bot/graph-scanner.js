@@ -65,6 +65,8 @@ const {
   FLASH_MODE: SCANNER_FLASH_MODE,
 } = require("./scanner");
 
+const FLASH_MODE = !!process.env.FLASH_MODE;
+
 // Both this file and scanner.js compute FLASH_MODE independently from the
 // same process.env.FLASH_MODE at module-load time — they should always
 // agree since it's the same env var, but asserting it here turns a
@@ -81,8 +83,6 @@ if (FLASH_MODE !== SCANNER_FLASH_MODE) {
   );
   process.exit(1);
 }
-
-const FLASH_MODE = !!process.env.FLASH_MODE;
 
 if (!cfg.tokens.USDC) {
   console.error("FATAL: BASE_USDC env var not set. Verify the address on BaseScan before setting it.");
@@ -882,7 +882,17 @@ async function scanOnce(graph, metrics = NOOP_METRICS) {
   }
 }
 
-main().catch((err) => {
-  console.error("fatal:", err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error("fatal:", err);
+    process.exit(1);
+  });
+}
+
+module.exports = {
+  buildRequoteRequests,
+  chainQuotesIntoRoute,
+  filterCandidateCycles,
+  scanOnce,
+  FLASH_MODE,
+};

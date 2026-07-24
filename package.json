@@ -3,6 +3,7 @@
   "version": "0.2.0",
   "private": true,
   "scripts": {
+    "test": "node bot/execution/txSubmitter.test.js && node bot/execution/executionModules.test.js && node bot/observability/db.test.js && node bot/scanner.smoke.test.js && npm run test:graph && npm run backtest:test",
     "scan": "node bot/scanner.js",
     "scan:flash": "FLASH_MODE=1 node bot/scanner.js",
     "scan:graph": "node bot/graph-scanner.js",

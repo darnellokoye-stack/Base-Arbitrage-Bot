@@ -142,7 +142,7 @@ function createPrivateRelayClient({ relayUrl, fetchImpl = fetch }) {
     return json.result;
   }
 
-  return { sendPrivateTransaction, simulateBundle };
+  return { sendPrivateTransaction, simulateBundle, supportsBundleSimulation: true };
 }
 
 /**
@@ -223,7 +223,7 @@ function createBloxrouteRelayClient({ authHeader, fetchImpl = fetch }) {
     );
   }
 
-  return { sendPrivateTransaction, simulateBundle };
+  return { sendPrivateTransaction, simulateBundle, supportsBundleSimulation: false };
 }
 
 /**
@@ -349,6 +349,7 @@ function createRelayManager({ relayClients, healthCooldownMs = 30_000, fetchImpl
     sendPrivateTransaction,
     getHealthSnapshot,
     health: getHealthSnapshot(),
+    supportsBundleSimulation: relayClients.every((relay) => !!relay.supportsBundleSimulation),
   };
 }
 

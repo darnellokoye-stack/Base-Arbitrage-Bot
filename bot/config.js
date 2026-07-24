@@ -5,10 +5,33 @@
 // point, not a substitute for your own on-chain re-verification
 // (cast call / a real read function) before committing real capital.
 
+const { getAddress, isAddress } = require("viem");
+
 const RPC_URL = process.env.BASE_RPC_URL || "https://mainnet.base.org";
 const WS_RPC_URL = process.env.BASE_WS_RPC_URL || null;
 
-function parseAddressList(value) {
+function parseAddress(value, name, { required = false } = {}) {
+  if (!value) {
+    if (required) throw new Error(`config: ${name} is required`);
+    return null;
+  }
+  const trimmed = value.trim();
+  if (!isAddress(trimmed)) {
+    throw new Error(`config: ${name} is not a valid EVM address: ${value}`);
+  }
+  return getAddress(trimmed);
+}
+
+function parseAddressList(value, name) {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry, index) => parseAddress(entry, `${name}[${index}]`, { required: true }));
+}
+
+function parseUrlList(value) {
   if (!value) return [];
   return value
     .split(",")
@@ -27,6 +50,7 @@ function parseNumericList(value) {
 
 module.exports = {
   RPC_URL,
+  RPC_URLS: parseUrlList(process.env.BASE_RPC_URLS || RPC_URL),
   WS_RPC_URL,
   chainId: 8453,
 
@@ -34,7 +58,7 @@ module.exports = {
     // Base's canonical WETH predeploy — confirmed live via BaseScan
     // (matches the address embedded in Aerodrome's own deployed Router
     // ABI, cross-checked independently).
-    WETH: process.env.BASE_WETH || "0x4200000000000000000000000000000000000006",
+    WETH: parseAddress(process.env.BASE_WETH || "0x4200000000000000000000000000000000000006", "BASE_WETH", { required: true }),
 
     // Native USDC on Base (Circle-issued, not a bridged/wrapped variant).
     // NOT hardcoded from memory — set this explicitly and verify on
@@ -43,7 +67,7 @@ module.exports = {
     // common target for lookalike/scam token confusion and this project
     // has already been burned once by trusting an address without
     // independent verification.
-    USDC: process.env.BASE_USDC || null,
+    USDC: parseAddress(process.env.BASE_USDC || null, "BASE_USDC"),
   },
 
   dexes: {
@@ -51,12 +75,12 @@ module.exports = {
     // 24.2M+ transactions, verified contract, active balance at time of
     // writing. Plain UniswapV2Router shape — works with the existing
     // UniswapV2Adapter unmodified.
-    uniswapV2Router: process.env.BASE_UNIV2_ROUTER || "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24",
+    uniswapV2Router: parseAddress(process.env.BASE_UNIV2_ROUTER || "0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24", "BASE_UNIV2_ROUTER", { required: true }),
 
     // Uniswap V2 Factory on Base. Confirmed via Uniswap's own official
     // docs (developers.uniswap.org/docs/protocols/v2/deployments, "Base"
     // row). Used by the new-pool listener for PairCreated events.
-    uniswapV2Factory: process.env.BASE_UNIV2_FACTORY || "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6",
+    uniswapV2Factory: parseAddress(process.env.BASE_UNIV2_FACTORY || "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6", "BASE_UNIV2_FACTORY", { required: true }),
 
     // Aerodrome Finance — Base's largest DEX by TVL. Confirmed via the
     // deployed Router contract's own live, verified ABI on BaseScan
@@ -65,8 +89,8 @@ module.exports = {
     // NOT a plain UniswapV2 shape — uses AerodromeAdapter, not
     // UniswapV2Adapter. See contracts/interfaces/IAerodromeRouter.sol for
     // the specific ABI differences.
-    aerodromeRouter: process.env.BASE_AERODROME_ROUTER || "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43",
-    aerodromeFactory: process.env.BASE_AERODROME_FACTORY || "0x420DD381b31aEf6683db6B902084cB0FFECe40Da",
+    aerodromeRouter: parseAddress(process.env.BASE_AERODROME_ROUTER || "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43", "BASE_AERODROME_ROUTER", { required: true }),
+    aerodromeFactory: parseAddress(process.env.BASE_AERODROME_FACTORY || "0x420DD381b31aEf6683db6B902084cB0FFECe40Da", "BASE_AERODROME_FACTORY", { required: true }),
   },
 
   flashLoan: {
@@ -75,7 +99,7 @@ module.exports = {
     // writing. NOT ERC-3156 shaped — see contracts/interfaces/
     // IAaveV3Flash.sol for the specific callback/function differences from
     // the SyncSwap-based flash contract this replaces.
-    aavePool: process.env.BASE_AAVE_POOL || "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5",
+    aavePool: parseAddress(process.env.BASE_AAVE_POOL || "0xA238Dd80C259a72e81d7e4664a9801593F98d1c5", "BASE_AAVE_POOL", { required: true }),
   },
 
   // Deployed contract addresses — filled in after you deploy (see
@@ -83,13 +107,13 @@ module.exports = {
   // startup rather than silently pointing at a zero address if you forget
   // to set these post-deployment.
   contracts: {
-    triangleArb: process.env.BASE_TRIANGLE_ARB || null,
-    triangleArbAaveFlash: process.env.BASE_TRIANGLE_ARB_AAVE_FLASH || null,
+    triangleArb: parseAddress(process.env.BASE_TRIANGLE_ARB || null, "BASE_TRIANGLE_ARB"),
+    triangleArbAaveFlash: parseAddress(process.env.BASE_TRIANGLE_ARB_AAVE_FLASH || null, "BASE_TRIANGLE_ARB_AAVE_FLASH"),
     // Per-DEX adapter contracts (deployed once, reused across every scan —
     // NOT the same as the DEX's own router address above; these are this
     // project's own ISwapAdapter-implementing wrapper contracts).
-    uniswapV2Adapter: process.env.BASE_UNIV2_ADAPTER || null,
-    aerodromeAdapter: process.env.BASE_AERODROME_ADAPTER || null,
+    uniswapV2Adapter: parseAddress(process.env.BASE_UNIV2_ADAPTER || null, "BASE_UNIV2_ADAPTER"),
+    aerodromeAdapter: parseAddress(process.env.BASE_AERODROME_ADAPTER || null, "BASE_AERODROME_ADAPTER"),
   },
 
   // Same gas-aware minProfit pattern as the original zkSync scanner —
@@ -98,7 +122,7 @@ module.exports = {
   minProfitMarginBps: BigInt(process.env.MIN_PROFIT_MARGIN_BPS || 0),
   slippageBps: BigInt(process.env.SLIPPAGE_BPS || 50), // 0.50% per leg
   maxRouteCandidates: Number(process.env.MAX_ROUTE_CANDIDATES || 50),
-  triangleTokens: parseAddressList(process.env.BASE_TRIANGLE_TOKENS),
+  triangleTokens: parseAddressList(process.env.BASE_TRIANGLE_TOKENS, "BASE_TRIANGLE_TOKENS"),
 
   amountInWei: BigInt(process.env.AMOUNT_IN_WEI || "100000000000000000"), // 0.1 WETH default
 
@@ -108,7 +132,7 @@ module.exports = {
   // (github.com/mds1/multicall, "Deployments" table lists Base at this
   // address). Re-verify on BaseScan before relying on it, same standard
   // as every other address in this file.
-  multicall3: process.env.BASE_MULTICALL3 || "0xcA11bde05977b3631167028862bE2a173976CA11",
+  multicall3: parseAddress(process.env.BASE_MULTICALL3 || "0xcA11bde05977b3631167028862bE2a173976CA11", "BASE_MULTICALL3", { required: true }),
 
   // Dynamic liquidity graph settings (event-driven reserve cache instead
   // of an on-chain getAmountsOut call per candidate). See bot/graph/.
@@ -188,6 +212,7 @@ module.exports = {
     // broadcasts of large-value trades when an operator intended to use
     // private submission only.
     allowPublicFallback: (process.env.ALLOW_PUBLIC_FALLBACK || "false") === "true",
+    requirePrivateRelayForLive: (process.env.LIVE_TRADING_REQUIRES_PRIVATE_RELAY || "true") === "true",
     // If `allowPublicFallback` is false and no private relay is configured,
     // reject any trade whose `amountIn` (the second arg to executeTriangle)
     // exceeds this wei threshold. Default 0 (reject all public broadcasts

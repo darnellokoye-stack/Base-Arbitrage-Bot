@@ -11,7 +11,7 @@
  */
 
 require("dotenv").config();
-const { createPublicClient, createWalletClient, http, formatUnits, encodeAbiParameters } = require("viem");
+const { createPublicClient, createWalletClient, http, formatUnits, encodeAbiParameters, fallback } = require("viem");
 const { base } = require("viem/chains");
 const { privateKeyToAccount } = require("viem/accounts");
 const cfg = require("./config");
@@ -23,6 +23,10 @@ const { createPrivateRelayClient, createBloxrouteRelayClient } = require("./exec
 const crypto = require('crypto');
 
 const FLASH_MODE = !!process.env.FLASH_MODE;
+const RPC_TRANSPORTS = (cfg.RPC_URLS && cfg.RPC_URLS.length > 0
+  ? cfg.RPC_URLS
+  : [cfg.RPC_URL]
+).map((url) => http(url));
 
 // --- Fail loudly on missing required config, rather than a confusing
 // downstream null-address revert later. ---
@@ -150,13 +154,20 @@ const TRIANGLE_ARB_ABI = [
 ];
 const CONTRACT_FUNCTION = FLASH_MODE ? "executeTriangleFlash" : "executeTriangle";
 
-const publicClient = createPublicClient({ chain: base, transport: http(cfg.RPC_URL) });
+const publicClient = createPublicClient({
+  chain: base,
+  transport: RPC_TRANSPORTS.length > 1 ? fallback(RPC_TRANSPORTS) : RPC_TRANSPORTS[0],
+});
 
 let walletClient = null;
 let account = null;
 if (process.env.PRIVATE_KEY) {
   account = privateKeyToAccount(process.env.PRIVATE_KEY);
-  walletClient = createWalletClient({ account, chain: base, transport: http(cfg.RPC_URL) });
+  walletClient = createWalletClient({
+    account,
+    chain: base,
+    transport: RPC_TRANSPORTS.length > 1 ? fallback(RPC_TRANSPORTS) : RPC_TRANSPORTS[0],
+  });
 }
 
 // Same dry-run pattern as the original zkSync scanner: estimateContractGas
@@ -180,10 +191,28 @@ const exporter = require('./observability/exporter');
 const alerts = require('./observability/alerts');
 const ologger = require('./observability/logger');
 
-// initialize local DB for trade history and stats
-observabilityDb.init();
+// initialize local DB for trade history and stats. Do not crash the bot on
+// observability storage failures; inserts will reject and be logged by callers.
+observabilityDb.init().catch((err) => {
+  ologger.error('observability.db', 'failed to initialize database', { error: err.message });
+});
+if (process.env.ENABLE_METRICS_SERVER !== "0") {
+  exporter.startExporter(process.env.MONITOR_PORT || 9467, async () => ({
+    ok: true,
+    mode: FLASH_MODE ? "flash" : "prefunded",
+    contract: CONTRACT_ADDRESS,
+    privateRelayConfigured: !!relayClient,
+    publicFallbackAllowed: cfg.execution.allowPublicFallback,
+    circuitBreaker: circuitBreaker.snapshot(),
+  }));
+}
 // periodic retention cleanup (daily)
-setInterval(() => observabilityDb.cleanupRetention(Number(process.env.OBS_RETENTION_DAYS || 90)), 24 * 3600 * 1000);
+const retentionTimer = setInterval(() => {
+  observabilityDb.cleanupRetention(Number(process.env.OBS_RETENTION_DAYS || 90)).catch((err) => {
+    ologger.error('observability.db', 'retention cleanup failed', { error: err.message });
+  });
+}, 24 * 3600 * 1000);
+if (retentionTimer.unref) retentionTimer.unref();
 
 const circuitBreaker = new CircuitBreaker({
   dailyLossLimitWei: cfg.execution.dailyLossLimitWei,
@@ -228,6 +257,21 @@ if (!relayClient) {
     "(see bot/execution/privateSubmit.js)."
   );
 }
+if (account && cfg.execution.requirePrivateRelayForLive) {
+  if (!relayClient) {
+    console.error(
+      "FATAL: LIVE_TRADING_REQUIRES_PRIVATE_RELAY is enabled, PRIVATE_KEY is set, and no private relay is configured."
+    );
+    process.exit(1);
+  }
+  if (cfg.execution.allowPublicFallback) {
+    console.error(
+      "FATAL: LIVE_TRADING_REQUIRES_PRIVATE_RELAY is enabled but ALLOW_PUBLIC_FALLBACK=true. " +
+      "Disable public fallback for live private trading."
+    );
+    process.exit(1);
+  }
+}
 
 // Constructed lazily inside submit() the first time a real submission
 // happens, AFTER nonceManager.sync() has run — createTxSubmitter itself
@@ -265,12 +309,9 @@ async function quoteUniV2(routerAddress, tokenIn, tokenOut, amountIn) {
 /// Aerodrome quoting requires knowing whether to route through the stable
 /// or volatile pool for a given pair — unlike UniV2, both can coexist for
 /// the same token pair with genuinely different reserves/pricing. This
-/// tries volatile first (the common case for a WETH/new-token pair) and
-/// falls back to stable only if the volatile route reverts (e.g. no
-/// volatile pool exists for this pair). This is a heuristic, not a
-/// guarantee of the BEST route — a thorough scanner would quote both and
-/// take the better one; left as a documented simplification rather than
-/// silently picking one without explanation.
+/// quotes both pool types and takes the better live output. Stable-pool
+/// support is still carried through the existing adapter extraData, so this
+/// improves route quality without changing the on-chain public interface.
 async function quoteAerodrome(routerAddress, tokenIn, tokenOut, amountIn, factory) {
   const tryRoute = async (stable) => {
     const amounts = await publicClient.readContract({
@@ -282,20 +323,19 @@ async function quoteAerodrome(routerAddress, tokenIn, tokenOut, amountIn, factor
     return amounts[amounts.length - 1];
   };
 
-  try {
-    return { amountOut: await tryRoute(false), stable: false };
-  } catch (volatileErr) {
-    try {
-      return { amountOut: await tryRoute(true), stable: true };
-    } catch (stableErr) {
-      throw new Error(
-        `Aerodrome router at ${routerAddress} rejected getAmountsOut() for both ` +
-        `stable and volatile routes on ${tokenIn} -> ${tokenOut}. Volatile error: ` +
-        `${volatileErr.shortMessage || volatileErr.message}. Stable error: ` +
-        `${stableErr.shortMessage || stableErr.message}`
-      );
-    }
+  const [volatile, stable] = await Promise.allSettled([tryRoute(false), tryRoute(true)]);
+  const quotes = [];
+  if (volatile.status === "fulfilled") quotes.push({ amountOut: volatile.value, stable: false });
+  if (stable.status === "fulfilled") quotes.push({ amountOut: stable.value, stable: true });
+  if (quotes.length === 0) {
+    throw new Error(
+      `Aerodrome router at ${routerAddress} rejected getAmountsOut() for both ` +
+      `stable and volatile routes on ${tokenIn} -> ${tokenOut}. Volatile error: ` +
+      `${volatile.reason?.shortMessage || volatile.reason?.message}. Stable error: ` +
+      `${stable.reason?.shortMessage || stable.reason?.message}`
+    );
   }
+  return quotes.sort((a, b) => (a.amountOut > b.amountOut ? -1 : a.amountOut < b.amountOut ? 1 : 0))[0];
 }
 
 /// Startup check: confirms both configured DEX routers actually respond to
@@ -427,6 +467,10 @@ function scoreOpportunity(route, amountIn, netProfitWei, gasCostWei, dynamicSlip
   const confidenceScore = Math.max(0, 1 - Math.min(1, dynamicSlippageBps / 2000));
   const expectedProfit = Number(route.amountOut > amountIn ? route.amountOut - amountIn : 0n) / 1e18;
   return (profitScore * 2) + expectedProfit + liquidityScore + confidenceScore - gasPenalty;
+}
+
+function netProfitFromSimulation(simulatedProfit) {
+  return simulatedProfit;
 }
 
 function uniqueAddresses(addresses) {
@@ -671,13 +715,13 @@ const executedRoutesByBlock = new Map();
 async function submit(legs, amountIn, minProfit) {
   if (!walletClient) {
     console.log(">>> [DRY RUN] would submit — no PRIVATE_KEY set, not sending a transaction.");
-    return;
+    return { confirmed: false, dryRun: true, viaPrivateRelay: false, reason: "dry run" };
   }
 
   const gate = circuitBreaker.checkAllowed();
   if (!gate.allowed) {
     console.warn(`submit skipped: circuit breaker is tripped — ${gate.reason}`);
-    return;
+    return { confirmed: false, reason: `circuit breaker: ${gate.reason}` };
   }
 
   try {
@@ -704,6 +748,7 @@ async function submit(legs, amountIn, minProfit) {
           allowPublicFallback: cfg.execution.allowPublicFallback,
           publicBroadcastMaxWei: cfg.execution.publicBroadcastMaxWei,
           estimationAccount: ESTIMATION_ACCOUNT,
+          simulatePrivateRelay: cfg.privateRelay.simulateBeforeSend,
         },
         {
           confirmationTimeoutBlocks: cfg.execution.confirmationTimeoutBlocks,
@@ -731,6 +776,7 @@ async function submit(legs, amountIn, minProfit) {
     } else {
       console.error(`submit did not confirm: ${result.reason}`);
     }
+    return result;
   } finally {
     // no global txInFlight flag to toggle
   }
@@ -770,8 +816,6 @@ const metricsAdapter = {
 
 async function evaluateAndMaybeSubmit(route, amountIn, startToken, flashFee, metrics = NOOP_METRICS, currentBlock = null, options = {}) {
   const legs = route.legs.map(legFromQuote);
-  const flashPremium = flashFee ? flashFee.premium : 0n;
-  const flashPremiumBps = flashFee ? flashFee.premiumBps : 0n;
   const skipSubmit = !!(options && options.skipSubmit);
 
   // Use actual suggested fees when computing the gas floor rather than
@@ -828,7 +872,11 @@ async function evaluateAndMaybeSubmit(route, amountIn, startToken, flashFee, met
     return false;
   }
 
-  const netProfitBeforeGas = simulatedProfit > flashPremium ? simulatedProfit - flashPremium : 0n;
+  // executeTriangleFlash returns profit after principal + premium repayment
+  // (see TriangleArbAaveFlash.executeOperation), so simulateExecution()
+  // already includes the flash premium. Subtracting it here would double
+  // charge flash-mode routes.
+  const netProfitBeforeGas = netProfitFromSimulation(simulatedProfit);
   const profitable = netProfitBeforeGas >= requiredProfit;
 
   const dynamicSlippageBps = Math.max(
@@ -867,10 +915,21 @@ async function evaluateAndMaybeSubmit(route, amountIn, startToken, flashFee, met
     return false;
   }
 
+  const rHash = routeHashFor(route, amountIn);
+  if (inFlightRoutes.has(rHash)) {
+    console.log(`route already in flight; skipping duplicate submission for ${routeLabel(route)}`);
+    metrics.incr("evaluate.route_in_flight");
+    return false;
+  }
+  if (currentBlock != null && executedRoutesByBlock.get(currentBlock)?.has(rHash)) {
+    console.log(`route already submitted in block ${currentBlock}; skipping duplicate for ${routeLabel(route)}`);
+    metrics.incr("evaluate.route_block_deduped");
+    return false;
+  }
+
   // Reserve route dedupe and mark in-flight before launching background
-  // submission so concurrent scanners/processes see the reservation.
+  // submission so later scan cycles see the reservation.
   try {
-    const rHash = routeHashFor(route, amountIn);
     inFlightRoutes.add(rHash);
     if (currentBlock != null) {
       const set = executedRoutesByBlock.get(currentBlock) || new Set();
@@ -888,7 +947,7 @@ async function evaluateAndMaybeSubmit(route, amountIn, startToken, flashFee, met
         const durationMs = Date.now() - startMs;
         // Record submission latency and outcomes
         try {
-          observability.incrCounter('submission_attempts_total', { viaPrivate: result.viaPrivateRelay ? '1' : '0' });
+          observability.incrCounter('submission_attempts_total', { viaPrivate: result && result.viaPrivateRelay ? '1' : '0' });
           observability.observeLatency('submission_latency_ms', durationMs, {});
         } catch (e) {}
 
@@ -903,18 +962,18 @@ async function evaluateAndMaybeSubmit(route, amountIn, startToken, flashFee, met
             // route may have simulatedProfit/netProfitBeforeGas attached earlier in evaluate phase
             const simulatedProfit = route.simulatedProfit || null;
             const netProfit = route.netProfitBeforeGas || null;
-            const flashFee = flashFee ? flashFee.premium : 0n;
+            const flashFeeWei = flashFee ? flashFee.premium : 0n;
             db.insertTrade({
               ts: new Date().toISOString(),
               blockNumber: result.receipt ? result.receipt.blockNumber : null,
               route: routeLabel(route),
               dexSequence: route.legs.map(l => l.venue).join(','),
-              flashAmountWei: flashFee ? flashFee.toString() : null,
+              flashAmountWei: FLASH_MODE ? amountIn.toString() : null,
               grossProfitWei: simulatedProfit ? simulatedProfit.toString() : null,
               netProfitWei: netProfit ? netProfit.toString() : null,
               gasUsed: gasUsed,
               gasCostWei: gasCostWei,
-              flashFeeWei: flashFee ? flashFee.toString() : null,
+              flashFeeWei: flashFeeWei ? flashFeeWei.toString() : null,
               execDurationMs: execMs,
               relay: relay,
               confirmationTimeMs: result.receipt && result.receipt.blockNumber ? 0 : null,
@@ -960,24 +1019,23 @@ async function scanOnce() {
     // proceed with null -> evaluateAndMaybeSubmit will fallback
   }
 
-  let flashFee = null;
-  if (FLASH_MODE) {
-    const hasCapacity = await checkFlashLoanCapacity(startToken, amountIn);
-    if (!hasCapacity) {
-      console.log("Aave pool lacks capacity for this loan size; skipping.");
-      return;
-    }
-    try {
-      flashFee = await getAaveFlashPremium(amountIn);
-    } catch (err) {
-      console.error("Aave flash premium read failed:", err.shortMessage || err.message);
-      return;
-    }
-  }
-
   let bestCandidate = null;
   for (const candidate of candidates) {
     const effectiveAmountIn = candidate.amountIn || amountIn;
+    let flashFee = null;
+    if (FLASH_MODE) {
+      const hasCapacity = await checkFlashLoanCapacity(startToken, effectiveAmountIn);
+      if (!hasCapacity) {
+        console.log("Aave pool lacks capacity for this candidate loan size; skipping.");
+        continue;
+      }
+      try {
+        flashFee = await getAaveFlashPremium(effectiveAmountIn);
+      } catch (err) {
+        console.error("Aave flash premium read failed:", err.shortMessage || err.message);
+        continue;
+      }
+    }
     const profitable = await evaluateAndMaybeSubmit(
       candidate,
       effectiveAmountIn,
@@ -988,6 +1046,7 @@ async function scanOnce() {
       { skipSubmit: true }
     );
     if (!profitable) continue;
+    candidate.flashFee = flashFee;
     if (!bestCandidate || (candidate.score || 0) > (bestCandidate.score || 0)) {
       bestCandidate = candidate;
     }
@@ -998,11 +1057,25 @@ async function scanOnce() {
   }
 
   const effectiveAmountIn = bestCandidate.amountIn || amountIn;
+  let finalFlashFee = bestCandidate.flashFee || null;
+  if (FLASH_MODE) {
+    const hasCapacity = await checkFlashLoanCapacity(startToken, effectiveAmountIn);
+    if (!hasCapacity) {
+      console.log("Aave pool lacks capacity for selected loan size; skipping.");
+      return;
+    }
+    try {
+      finalFlashFee = await getAaveFlashPremium(effectiveAmountIn);
+    } catch (err) {
+      console.error("Aave flash premium read failed:", err.shortMessage || err.message);
+      return;
+    }
+  }
   await evaluateAndMaybeSubmit(
     bestCandidate,
     effectiveAmountIn,
     startToken,
-    flashFee,
+    finalFlashFee,
     metrics,
     currentBlock
   );
@@ -1082,6 +1155,7 @@ module.exports = {
   routeLabel,
   checkFlashLoanCapacity,
   getAaveFlashPremium,
+  netProfitFromSimulation,
   CONTRACT_ADDRESS,
   FLASH_MODE,
 };

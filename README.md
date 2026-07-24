@@ -45,9 +45,9 @@ capital yet:**
   bot yet. Treat fork success as integration proof, not proof that a live
   opportunity is profitable or safe to submit publicly.
 - `AerodromeAdapter`'s stable-vs-volatile route selection
-  (`quoteAerodrome` in `bot/scanner.js`) is a documented heuristic (try
-  volatile, fall back to stable), not a "best route" guarantee — a thorough
-  version would quote both and take the better one.
+  (`quoteAerodrome` in `bot/scanner.js`) quotes both pool types where they
+  exist and selects the better live output while preserving the same adapter
+  calldata shape.
 - USDC address on Base is deliberately left unset (`BASE_USDC` env var,
   no default) — verify it yourself on BaseScan/Circle's docs before use,
   the same discipline this project applied to zkSync's USDT address.
@@ -97,12 +97,12 @@ npm run scan                     # pre-funded mode
 npm run scan:flash               # Aave V3 flash-loan mode
 ```
 
-In flash mode, the scanner now reads Aave's live
-`FLASHLOAN_PREMIUM_TOTAL()`, subtracts the flash premium from quote P&L,
-adds the gas-aware profit floor, applies per-leg slippage floors to the
-exact calldata, and runs an `eth_call` simulation before any transaction is
-submitted. If the exact calldata cannot clear the contract's
-`minProfit` guard, it is skipped.
+In flash mode, the scanner reads Aave's live `FLASHLOAN_PREMIUM_TOTAL()`
+for capacity/accounting visibility, applies a gas-aware profit floor,
+applies per-leg slippage floors to the exact calldata, and runs an
+`eth_call` simulation before any transaction is submitted. The flash
+contract returns profit after principal + premium repayment, so the scanner
+does not subtract the premium a second time.
 
 The scanner generates real 3-hop candidate cycles:
 `WETH -> tokenA -> tokenB -> WETH`. `BASE_USDC` is included automatically;
@@ -128,13 +128,13 @@ migration above)
 1. New-pool listener — built, discovery-only (see `bot/base-edges/`)
 2. Small-trade size sweep — built, quote/math verified, execution still a
    dry-run stub pending real gas estimates from a deployed contract
-3. Private submission via a Base builder/relay — plumbing built
-   (`bot/execution/privateSubmit.js`: signed-tx-to-relay submission +
-   `eth_callBundle` simulation, public-mempool fallback), but NOT wired
-   into the default `submit()` broadcast path — see that module's header
-   and `bot/scanner.js`'s `submit()` comment for why swapping it in isn't
-   a drop-in change. Requires `BASE_PRIVATE_RELAY_URL` set to a relay
-   endpoint you've independently verified; unset means disabled.
+3. Private submission via a Base builder/relay — wired into
+   `bot/scanner.js` through `txSubmitter`. Transactions are locally signed,
+   optionally simulated by compatible relays, sent privately when a relay is
+   configured, and can fall back to public broadcast only when policy allows
+   it. Requires either `BASE_PRIVATE_RELAY_URL` or
+   `BASE_PRIVATE_RELAY_PROVIDER=bloxroute` plus
+   `BASE_PRIVATE_RELAY_AUTH_HEADER`.
 4. Non-obvious token triangles — not started
 5. Backrunning — not started
 
@@ -157,11 +157,9 @@ you must verify yourself" above) applies here too:
   confirmation-depth window for reorg safety and a staleness fallback if
   events stop arriving. **Not yet run against live Base RPC in this
   sandbox — no network egress here.** The pool-address bootstrap step
-  (`bootstrapGraph()` in `graph-scanner.js`) is an explicit, logged TODO:
-  it does NOT yet call `UniswapV2Factory.getPair()` /
+  (`bootstrapGraph()` in `graph-scanner.js`) calls `UniswapV2Factory.getPair()`
+  and Aerodrome `PoolFactory.getPool()`, verifies deployed bytecode, reads
   Aerodrome `PoolFactory.getPool()` to discover real pool addresses —
-  wire that in (and verify the returned addresses) before running this
-  for real, rather than assuming it already works.
 - **`bot/graph/negativeCycle.js`** — Bellman-Ford negative-cycle
   detection over the graph, generalizing the existing scanner's
   fixed-3-hop cross-product to cycles of any length (capped at 5 hops by
